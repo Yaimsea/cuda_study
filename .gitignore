@@ -1,0 +1,6 @@
+# 忽略所有可执行文件
+matrix_product
+vector_add
+
+# 忽略编译产生的中间文件
+*.o
