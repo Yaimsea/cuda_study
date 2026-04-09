@@ -1,0 +1,86 @@
+#include <iostream>
+
+const float eps=1e-5;
+const int N=4096;
+const int M1=4096;
+const int M2=4096;
+const bool debugEnabled = false;
+
+__global__ void matrixProduct(const float *A,const float *B,float *C,int n,int m1,int m2)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int idy = blockIdx.y * blockDim.y + threadIdx.y;
+    if(idx < m2 && idy < n)
+    {
+        for(int i = 0; i < m1; ++i)
+            C[idy * m2 + idx] += A[idy * m1 + i] * B[i * m2 + idx];
+    }
+    return;
+}
+
+void debugPrint(int i,int j,float *h_C)
+{
+    std::cout << i << ' ' << j << std::endl;
+    std::cout << h_C[i * M2 + j] << ' ' << 2.0f * M1 << std::endl;
+    std::cout << fabs(h_C[i * M2 + j] - 2.0f * M1) / (2.0f * M1) << std::endl;
+    return;
+}
+
+int main()
+{
+    size_t size1 = N * M1 * sizeof(float);
+    size_t size2 = M1 * M2 * sizeof(float);
+    size_t size3 = N * M2 * sizeof(float);
+
+    float *h_A = (float*)malloc(size1);
+    float *h_B = (float*)malloc(size2);
+    float *h_C = (float*)malloc(size3);
+    for(int i = 0; i < N; ++i)
+        for(int j = 0;j < M1; ++j)
+            h_A[i * M1 + j] = 1.0;
+    for(int i = 0; i < M1; ++i)
+        for(int j = 0;j < M2; ++j)
+            h_B[i * M2 + j] = 2.0;
+    for(int i = 0; i < N; ++i)
+        for(int j = 0;j < M2; ++j)
+            h_C[i * M2 + j] = 0.0;
+
+    float *d_A,*d_B,*d_C;
+    cudaMalloc((void**)&d_A, size1);
+    cudaMalloc((void**)&d_B, size2);
+    cudaMalloc((void**)&d_C, size3);
+
+    cudaMemcpy(d_A, h_A, size1, cudaMemcpyHostToDevice);
+    cudaMemcpy(d_B, h_B, size2, cudaMemcpyHostToDevice);
+    cudaMemcpy(d_C, h_C, size3, cudaMemcpyHostToDevice);
+
+    dim3 threadsPerBlock(16, 16);
+    dim3 blockPerGird((M2 + 15) / 16, (N + 15) / 16);
+    matrixProduct<<<blockPerGird,threadsPerBlock>>>(d_A, d_B, d_C, N, M1, M2);
+
+    cudaMemcpy(h_C, d_C, size3, cudaMemcpyDeviceToHost);
+
+    bool flag = true;
+    for(int i = 0; i < N; ++i)
+    {
+        for(int j = 0;j < M2; ++j)
+        {
+            if(fabs(h_C[i * M2 + j] - 2.0f * M1) / (2.0f * M1) > eps)
+            {
+                flag = false;
+                if(debugEnabled)
+                    debugPrint(i, j, h_C);
+                break;
+            }
+        }
+        if(!flag)
+            break;
+    }
+
+    std::cout << (flag ? "OK! Correct!" : "WA! Check your code!") << std::endl;
+
+    cudaFree(d_A); cudaFree(d_B); cudaFree(d_C);
+    free(h_A); free(h_B); free(h_C);
+
+    return 0;
+}
