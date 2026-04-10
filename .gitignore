@@ -4,3 +4,16 @@ vector_add
 
 # 忽略编译产生的中间文件
 *.o
+
+# 忽略 CUDA/NVIDIA profiling 报告
+*.nsys-rep
+*.ncu-rep
+*.sqlite
+
+# 忽略 CUDA 编译临时文件
+*.ptx
+*.cubin
+*.fatbin
+
+# 忽略 Codex 本地临时文件
+.codex
