@@ -8,37 +8,15 @@ const int M2 = 4096;
 const int blockSize = 16;
 const bool debugEnabled = false;
 
-__global__ void matrixProduct(const double *A,const double *B,double *C,int n,int m1,int m2,int tileSize)
+__global__ void matrixProduct(const double *A,const double *B,double *C,int n,int m1,int m2)
 {
-
-    __shared__ double As[blockSize][blockSize];
-    __shared__ double Bs[blockSize][blockSize];
-    double sum = 0.0;
-
-    for(int i = 0; i < tileSize ; ++i)
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int idy = blockIdx.y * blockDim.y + threadIdx.y;
+    if(idx < m2 && idy < n)
     {
-        int Aidx = i * blockDim.x + threadIdx.x;
-        int Aidy = blockIdx.y * blockDim.y + threadIdx.y;
-        if(Aidx >= m1 || Aidy >= n)
-            As[threadIdx.y][threadIdx.x] = 0.0;
-        else
-            As[threadIdx.y][threadIdx.x] = A[Aidy * m1 + Aidx];
-        int Bidx = blockIdx.x * blockDim.x + threadIdx.x;
-        int Bidy = i * blockDim.y + threadIdx.y;
-        if(Bidx >= m2 || Bidy >= m1)
-            Bs[threadIdx.y][threadIdx.x] = 0.0;
-        else
-            Bs[threadIdx.y][threadIdx.x] = B[Bidy * m2 + Bidx];
-        __syncthreads();
-        for(int j = 0; j < blockSize; ++j)
-            sum += As[threadIdx.y][j] * Bs[j][threadIdx.x];
-        __syncthreads();
+        for(int i = 0; i < m1; ++i)
+            C[idy * m2 + idx] += A[idy * m1 + i] * B[i * m2 + idx];
     }
-
-    int Cidx = blockIdx.x * blockDim.x + threadIdx.x;
-    int Cidy = blockIdx.y * blockDim.y + threadIdx.y;
-    if(Cidx < m2 && Cidy < n)
-        C[Cidy * m2 + Cidx] = sum;
     return;
 }
 
@@ -81,7 +59,7 @@ int main()
     dim3 threadsPerBlock(blockSize, blockSize);
     dim3 blockPerGird((M2 + blockSize - 1) / blockSize, (N + blockSize - 1) / blockSize);
     int tileSize = (M1 + blockSize - 1) / blockSize;
-    matrixProduct<<<blockPerGird,threadsPerBlock>>>(d_A, d_B, d_C, N, M1, M2, tileSize);
+    matrixProduct<<<blockPerGird,threadsPerBlock>>>(d_A, d_B, d_C, N, M1, M2);
 
     cudaMemcpy(h_C, d_C, size3, cudaMemcpyDeviceToHost);
 
