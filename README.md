@@ -318,9 +318,12 @@ vector_add
   - `Kernel duration 从 992.30 ms 降到 951.22 ms，提升约 4.1%`
 - 当前主要瓶颈:
   - `naive 版本主要卡在 Long Scoreboard Stall；shared 版本中这个问题不再主导，新的瓶颈转向 Tex Throttle 和 Short Scoreboard`
+- 关于 FP64 的额外观察:
+  - `Nsight Compute 提示这张 RTX 4060 Laptop GPU 的 fp32:fp64 峰值比约为 64:1。当前 double 版本的 Compute Throughput 已经很高，说明双精度算力本身也在明显限制性能，这会压缩 shared memory 优化带来的收益。`
 - 下一步可以尝试:
   - `调 tile size 到 32x8 或 32x16`
   - `检查 shared memory bank conflicts 和 Source Counters`
+  - `调整测试数据，在保证测试强度的同时尝试让 float 版本也能稳定通过正确性校验`
 
 ### 公式备忘
 
@@ -336,3 +339,90 @@ Relative Error = abs((C - Ref) / Ref)
 Speedup = 992.30 / 951.22 = 1.043
 Improvement(%) = (992.30 - 951.22) / 992.30 * 100% = 4.14%
 ```
+
+### 测试数据设计过程
+
+这次为了比较 `naive` 和 `shared` 版本的性能，我专门调整了矩阵初始化方式。最开始使用的是更强的 `double` 测试数据：
+
+```text
+A[i][j] = i + 1
+B[i][j] = j + 1
+```
+
+这种写法的优点是正确性检验能力很强，因为输出矩阵中几乎每个位置的理论值都不同，索引错位、tile 搬运错位和写回错误都更容易暴露。但它的缺点也很明显：在 RTX 4060 Laptop GPU 这类消费级显卡上，`double` 性能会明显受到 FP64 吞吐限制，shared memory 的收益容易被压缩；同时如果直接切回 `float`，数值范围又太大，误差会明显上升。
+
+为了避免每次校验都在 CPU 上重新做一遍 `O(N^3)` 的矩阵乘法，我后来坚持了一个原则：
+
+```text
+A 只依赖 i
+B 只依赖 j
+```
+
+这样理论值就始终可以直接写成：
+
+```text
+C[i][j] = M1 * f(i) * g(j)
+```
+
+最后采用的版本是：
+
+```text
+A[i][j] = (i % 13) / 10 + 0.1
+B[i][j] = (j % 17) / 10 + 0.1
+```
+
+这个版本的考虑有几层：
+
+- `float` 下数值范围比较温和，不容易因为累加 4096 次就直接炸精度
+- `13 x 17 = 221` 种输出模式，明显比之前那种大块分段常数更有辨识度
+- `13` 和 `17` 都不和 `blockSize = 16` 对齐，尽量避免某些 tile 边界恰好掩盖错误
+- 理论值仍然能闭式计算，不需要 CPU 再跑一遍完整矩阵乘法
+
+这版实测结果是：
+
+```text
+OK! Correct!
+Max relative error = 5.60922e-05
+obtained it when i = 0, j = 13
+```
+
+最大相对误差没有出现在数值最大的位置，这说明这里的误差主要还是由 `float` 对十进制小数的表示误差，以及 4096 次累加产生的舍入误差共同决定，而不是简单由输出值大小决定。当前 `eps = 1e-4` 可以稳定通过，因此这组数据已经比较适合作为后续 `float` 版本的 profiling 输入。
+
+### float 测试数据版本
+
+在将测试数据调整为更适合 `float` 的输入后，我重新对 `naive` 和 `shared` 版本做了一轮 profiling。这个版本使用的是：
+
+```text
+A[i][j] = (i % 13) / 10 + 0.1
+B[i][j] = (j % 17) / 10 + 0.1
+```
+
+它的优点是：
+
+- 理论值仍然可以直接写成闭式公式，不需要 CPU 再做一遍 `O(N^3)` 矩阵乘法
+- 测试数据比大块分段常数更有辨识度
+- `float` 下可以稳定通过正确性校验
+
+这组数据下，两份程序的输出都是：
+
+```text
+OK! Correct!
+Max relative error is 5.60922e-05
+Obtain it when i = 0 and j = 13
+```
+
+对应的 Nsight Compute 结果如下：
+
+| 版本 | Kernel Duration (ms) | Compute Throughput (%) | Memory Throughput (%) | DRAM Throughput (%) | 结果 |
+|---|---:|---:|---:|---:|---|
+| Naive | 661.11 | 52.59 | 61.13 | 11.37 | OK |
+| Shared | 178.04 | 97.66 | 97.66 | 39.09 | OK |
+
+这一轮的加速比为：
+
+```text
+Speedup = 661.11 / 178.04 = 3.71
+Improvement(%) = (661.11 - 178.04) / 661.11 * 100% = 73.07%
+```
+
+这说明在当前 `float` 测试数据下，shared memory 优化的收益非常明显。相比 `naive` 版本，`shared` 版本不只是 kernel 时间大幅下降，而且 compute 与 memory 两侧的吞吐率都接近打满，说明这次优化真正把硬件资源利用起来了。

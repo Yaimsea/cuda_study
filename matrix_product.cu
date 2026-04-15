@@ -1,32 +1,36 @@
 #include <iostream>
 #include <cmath>
+#include <algorithm>
 
-const double eps = 1e-10;
+const float eps = 1e-4;
 const int N = 4096;
 const int M1 = 4096;
 const int M2 = 4096;
+const int imod = 13;
+const int jmod = 17;
+const float base = 10.0f;
 const int blockSize = 16;
-const bool debugEnabled = false;
+const bool debugEnabled = true;
 
-__global__ void matrixProduct(const double *A,const double *B,double *C,int n,int m1,int m2,int tileSize)
+__global__ void matrixProduct(const float *A,const float *B,float *C,int n,int m1,int m2,int tileSize)
 {
 
-    __shared__ double As[blockSize][blockSize];
-    __shared__ double Bs[blockSize][blockSize];
-    double sum = 0.0;
+    __shared__ float As[blockSize][blockSize];
+    __shared__ float Bs[blockSize][blockSize];
+    float sum = 0.0;
 
-    for(int i = 0; i < tileSize ; ++i)
+    for(int i = 0; i < tileSize; ++i)
     {
         int Aidx = i * blockDim.x + threadIdx.x;
         int Aidy = blockIdx.y * blockDim.y + threadIdx.y;
         if(Aidx >= m1 || Aidy >= n)
-            As[threadIdx.y][threadIdx.x] = 0.0;
+            As[threadIdx.y][threadIdx.x] = 0.0f;
         else
             As[threadIdx.y][threadIdx.x] = A[Aidy * m1 + Aidx];
         int Bidx = blockIdx.x * blockDim.x + threadIdx.x;
         int Bidy = i * blockDim.y + threadIdx.y;
         if(Bidx >= m2 || Bidy >= m1)
-            Bs[threadIdx.y][threadIdx.x] = 0.0;
+            Bs[threadIdx.y][threadIdx.x] = 0.0f;
         else
             Bs[threadIdx.y][threadIdx.x] = B[Bidy * m2 + Bidx];
         __syncthreads();
@@ -42,7 +46,7 @@ __global__ void matrixProduct(const double *A,const double *B,double *C,int n,in
     return;
 }
 
-void debugPrint(int i,int j,double *h_C,double targetNumber)
+void debugPrint(int i,int j,float *h_C,float targetNumber)
 {
     std::cout << i << ' ' << j << std::endl;
     std::cout << h_C[i * M2 + j] << ' ' << targetNumber << std::endl;
@@ -52,24 +56,24 @@ void debugPrint(int i,int j,double *h_C,double targetNumber)
 
 int main()
 {
-    size_t size1 = N * M1 * sizeof(double);
-    size_t size2 = M1 * M2 * sizeof(double);
-    size_t size3 = N * M2 * sizeof(double);
+    size_t size1 = N * M1 * sizeof(float);
+    size_t size2 = M1 * M2 * sizeof(float);
+    size_t size3 = N * M2 * sizeof(float);
 
-    double *h_A = (double*)malloc(size1);
-    double *h_B = (double*)malloc(size2);
-    double *h_C = (double*)malloc(size3);
+    float *h_A = (float*)malloc(size1);
+    float *h_B = (float*)malloc(size2);
+    float *h_C = (float*)malloc(size3);
     for(int i = 0; i < N; ++i)
         for(int j = 0;j < M1; ++j)
-            h_A[i * M1 + j] = (double)(i + 1);
+            h_A[i * M1 + j] = (float)(i % imod) / base + 0.1f;
     for(int i = 0; i < M1; ++i)
         for(int j = 0;j < M2; ++j)
-            h_B[i * M2 + j] = (double)(j + 1);
+            h_B[i * M2 + j] = (float)(j % jmod) / base + 0.1f;
     for(int i = 0; i < N; ++i)
         for(int j = 0;j < M2; ++j)
-            h_C[i * M2 + j] = 0.0;
+            h_C[i * M2 + j] = 0.0f;
 
-    double *d_A,*d_B,*d_C;
+    float *d_A,*d_B,*d_C;
     cudaMalloc((void**)&d_A, size1);
     cudaMalloc((void**)&d_B, size2);
     cudaMalloc((void**)&d_C, size3);
@@ -86,12 +90,21 @@ int main()
     cudaMemcpy(h_C, d_C, size3, cudaMemcpyDeviceToHost);
 
     bool flag = true;
+    float maxRelativeError = 0.0f;
+    int i_maxRelativeError,j_maxRelativeError;
     for(int i = 0; i < N; ++i)
     {
         for(int j = 0;j < M2; ++j)
         {
-            double targetNumber = ((double)((i + 1) * (j + 1))) * M1;
-            if(fabs((h_C[i * M2 + j] - targetNumber) / targetNumber) > eps)
+            float targetNumber = ((float)(i % imod) / base + 0.1f) * ((float)(j % jmod) / base + 0.1f) * M1;
+            float relativeError = fabs((h_C[i * M2 + j] - targetNumber) / targetNumber);
+            if(relativeError > maxRelativeError)
+            {
+                maxRelativeError = relativeError;
+                i_maxRelativeError = i;
+                j_maxRelativeError = j;
+            }
+            if(relativeError > eps)
             {
                 flag = false;
                 if(debugEnabled)
@@ -104,6 +117,8 @@ int main()
     }
 
     std::cout << (flag ? "OK! Correct!" : "WA! Check your code!") << std::endl;
+    std::cout << "Max relative error is " << maxRelativeError << std::endl;
+    std::cout << "Obtain it when i = " << i_maxRelativeError << " and j = " << j_maxRelativeError << std::endl;
 
     cudaFree(d_A); cudaFree(d_B); cudaFree(d_C);
     free(h_A); free(h_B); free(h_C);
