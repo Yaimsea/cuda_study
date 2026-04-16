@@ -1,6 +1,7 @@
 # 忽略所有可执行文件
 matrix_product
 matrix_product_naive
+matrix_product_32_8
 vector_add
 mm_naive
 mm_shared

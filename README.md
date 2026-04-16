@@ -426,3 +426,65 @@ Improvement(%) = (661.11 - 178.04) / 661.11 * 100% = 73.07%
 ```
 
 这说明在当前 `float` 测试数据下，shared memory 优化的收益非常明显。相比 `naive` 版本，`shared` 版本不只是 kernel 时间大幅下降，而且 compute 与 memory 两侧的吞吐率都接近打满，说明这次优化真正把硬件资源利用起来了。
+
+### block shape 参数扫描
+
+在确认 `float` 测试数据可用之后，我继续对不同 block shape 做了参数扫描。为了保证对比公平，这一轮统一使用：
+
+```bash
+nvcc -O3 -lineinfo ...
+```
+
+并对每个版本做三联重测，最后使用中位数作为记录结果。
+
+参与对比的版本包括：
+
+- `Naive`
+- `Shared 16x16`
+- `Shared 32x8`
+- `Shared 32x16`
+- `Shared 32x32`
+
+整理后的中位数结果如下：
+
+| 版本 | Kernel Duration (ms) | Compute Throughput (%) | Memory Throughput (%) | DRAM Throughput (%) |
+|---|---:|---:|---:|---:|
+| Naive | 700.49 | 51.86 | 64.69 | 11.02 |
+| Shared 16x16 | 190.96 | 95.45 | 95.45 | 38.33 |
+| Shared 32x8 | 216.64 | 96.49 | 96.49 | 66.80 |
+| Shared 32x16 | 205.42 | 89.69 | 89.69 | 36.01 |
+| Shared 32x32 | 220.03 | 75.38 | 75.38 | 16.52 |
+
+对应的加速比如下：
+
+```text
+Shared 16x16 vs Naive:
+Speedup = 700.49 / 190.96 = 3.67
+Improvement(%) = (700.49 - 190.96) / 700.49 * 100% = 72.74%
+
+Shared 32x8 vs Naive:
+Speedup = 700.49 / 216.64 = 3.23
+Improvement(%) = (700.49 - 216.64) / 700.49 * 100% = 69.07%
+
+Shared 32x16 vs Naive:
+Speedup = 700.49 / 205.42 = 3.41
+Improvement(%) = (700.49 - 205.42) / 700.49 * 100% = 70.67%
+
+Shared 32x32 vs Naive:
+Speedup = 700.49 / 220.03 = 3.18
+Improvement(%) = (700.49 - 220.03) / 700.49 * 100% = 68.59%
+```
+
+这轮扫描可以得出几个比较明确的结论：
+
+- 当前最优版本仍然是 `Shared 16x16`
+- `Shared 32x16` 比 `32x8` 和 `32x32` 更均衡，但依然没有超过 `16x16`
+- `Shared 32x8` 的 `Compute Throughput` 与 `Memory Throughput` 虽然很高，但 `DRAM Throughput` 明显更大，说明它更依赖外部带宽，最终没有转化为更短的 kernel 时间
+- `Shared 32x32` 的表现最差，Nsight Compute 也提示其 occupancy 受到寄存器、shared memory 和 block 内 warp 数量的限制
+
+因此，在当前硬件、当前测试数据和当前实现方式下，可以把 `16x16` 视为当前 shared memory 版本的最佳 block shape。继续单纯扫描 block shape 的收益已经不高，下一步更值得尝试的方向应该是：
+
+- register blocking
+- shared memory 访问模式优化
+- bank conflict 分析
+- source counters / warp state 的进一步定位
