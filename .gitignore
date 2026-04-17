@@ -5,6 +5,7 @@ matrix_product_32_8
 vector_add
 mm_naive
 mm_shared
+cublasSgemm
 
 # 忽略编译产生的中间文件
 *.o

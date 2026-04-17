@@ -427,6 +427,37 @@ Improvement(%) = (661.11 - 178.04) / 661.11 * 100% = 73.07%
 
 这说明在当前 `float` 测试数据下，shared memory 优化的收益非常明显。相比 `naive` 版本，`shared` 版本不只是 kernel 时间大幅下降，而且 compute 与 memory 两侧的吞吐率都接近打满，说明这次优化真正把硬件资源利用起来了。
 
+### naive 版本在 `ncu basic` 下的统一基线补测
+
+为了统一 profiling 口径，我后来又单独对 `naive` 版本重新使用：
+
+```bash
+ncu --set basic --kernel-name matrixProduct --force-overwrite -o naive_ncu ./mm_naive
+```
+
+这一轮重新补测得到的结果为：
+
+```text
+Kernel: matrixProduct
+Block size: 16 x 16
+Grid size: 256 x 256
+Matrix size: 4096 x 4096
+
+Nsight Compute (basic):
+Duration: 680.92 ms
+Compute Throughput: 51.73%
+Memory Throughput: 64.91%
+DRAM Throughput: 11.00%
+```
+
+这个结果和前面 block shape 扫描里记录的 `Naive = 700.49 ms` 非常接近，说明虽然单次 profiling 结果会有一定波动，但整体量级和结论是一致的：
+
+- `naive` 版本依然明显慢于后续所有 shared memory / register block 版本
+- 其主要特征仍然是 `Memory Throughput` 高于 `Compute Throughput`
+- `DRAM Throughput` 仍然不高，说明问题并不是简单地“显存带宽被完全打满”
+
+因此，后面关于 `naive -> shared -> register block` 这条优化主线的判断并没有改变；这次补测的意义主要在于把 `naive` 版本也统一到了 `ncu basic` 的 profiling 口径下。
+
 ### block shape 参数扫描
 
 在确认 `float` 测试数据可用之后，我继续对不同 block shape 做了参数扫描。为了保证对比公平，这一轮统一使用：
@@ -488,3 +519,348 @@ Improvement(%) = (700.49 - 220.03) / 700.49 * 100% = 68.59%
 - shared memory 访问模式优化
 - bank conflict 分析
 - source counters / warp state 的进一步定位
+
+### register block 参数扫描
+
+在确定 `16x16` 是当前 shared memory 版本的最佳 block shape 之后，我继续在这个 tile 上做了 register block 参数扫描。
+
+这里我采用的命名约定是：
+
+- `x_registerSize` 对应列方向
+- `y_registerSize` 对应行方向
+
+因此像 `1x4` 的含义不是“横向拉长 4”，而是：
+
+```text
+一个 thread 负责 1 列 x 4 行的输出子块
+```
+
+这一轮我主要测试了这些组合：
+
+- `1x1`
+- `1x2`
+- `1x4`
+- `1x8`
+- `1x16`
+- `2x2`
+- `2x4`
+- `4x2`
+- `4x4`
+
+其中 `1x1` 可以看作 shared memory 版本但不使用 register block 的 baseline，其结果就是前面 `Shared 16x16` 的中位数。
+
+所有版本同样统一使用：
+
+```bash
+nvcc -O3 -lineinfo ...
+```
+
+并尽量采用三联重测，中位数作为最终记录结果。整理后的结果如下：
+
+| Register Block | Kernel Duration (ms) | Compute Throughput (%) | Memory Throughput (%) | DRAM Throughput (%) | 备注 |
+|---|---:|---:|---:|---:|---|
+| `1x1` | 190.96 | 95.45 | 95.45 | 38.33 | shared baseline |
+| `1x2` | 130.92 | 92.99 | 92.99 | 52.63 | 明显优于 baseline |
+| `1x4` | 100.03 | 93.25 | 93.25 | 67.66 | 明显优于 `1x2` |
+| `1x8` | 91.45 | 89.68 | 89.68 | 73.76 | 当前最优 |
+| `1x16` | 223.49 | 97.31 | 97.31 | 30.96 | 单次测试已明显退化 |
+| `2x2` | 140.92 | 61.13 | 94.57 | 50.99 | 优于 baseline |
+| `2x4` | 115.36 | 57.12 | 95.36 | 58.81 | 强于 `2x2` |
+| `4x2` | 188.82 | 31.22 | 97.92 | 36.54 | 明显退化 |
+| `4x4` | 178.76 | 56.89 | 95.75 | 38.38 | 明显退化 |
+
+从这轮实验里可以看出几个非常明确的趋势：
+
+1. `register block` 确实有效。  
+   只要从 `1x1` 走到 `1x2`，kernel 时间就从 `190.96 ms` 下降到了 `130.92 ms`。
+
+2. 这份 kernel 更偏好沿 `y` 方向增大 register block。  
+   也就是说，在当前实现里，一个线程负责更多“行方向输出”比扩展成更大的二维子块更有效。
+
+3. 最优点不是“越大越好”，而是存在明显甜点。  
+   `1x2 -> 1x4 -> 1x8` 持续变快，但 `1x16` 直接明显退化，说明 block 内线程数太少后，warp 利用率和调度效率会变差。
+
+4. 二维更大的 register block 并没有赢。  
+   `2x4` 虽然表现不错，但仍然不如 `1x4` 和 `1x8`；`4x2`、`4x4` 都进一步退化。
+
+在这一轮 register block 参数扫描中，最好的结果来自：
+
+```text
+Shared 16x16 + register block 1x8
+```
+
+它相对 `naive` 的加速比为：
+
+```text
+Speedup = 700.49 / 91.45 = 7.66
+Improvement(%) = (700.49 - 91.45) / 700.49 * 100% = 86.95%
+```
+
+相对 shared memory 但不使用 register block 的 `1x1` baseline，则有：
+
+```text
+Speedup = 190.96 / 91.45 = 2.09
+Improvement(%) = (190.96 - 91.45) / 190.96 * 100% = 52.11%
+```
+
+这说明在当前硬件和当前 kernel 结构下，register block 的收益甚至比我前面做 block shape 扫描时更大。也就是说，下一阶段真正值得继续深入的方向已经不再是简单换 block shape，而是围绕当前最优的 `16x16 + 1x8` 版本，进一步分析：
+
+- shared memory 访问模式
+- bank conflict
+- source counters
+- warp state / stall 原因
+
+### 32x32 tile 上的 register block 复测
+
+在前面的 block shape 扫描里，`Shared 32x32` 的表现并不理想，因此当时的判断更偏向于认为 `32x32` 不是当前实现的最佳选择。
+
+但在继续引入 `register block` 之后，这个结论需要更新。新的实验结果表明：
+
+```text
+32x32 tile 这条线本身并不差；
+真正决定表现的关键，在于它是否搭配了合适的 register block。
+```
+
+这一轮我继续围绕 `32x32 tile` 做了三组复测，主要比较：
+
+- `1x4`
+- `1x8`
+- `1x16`
+
+其中 `32x32 tile + 1x8 register block` 的三次结果为：
+
+```text
+63.38 ms, Compute 98.62%, Memory 98.62%, DRAM 53.90%
+72.47 ms, Compute 98.21%, Memory 98.21%, DRAM 51.99%
+64.38 ms, Compute 98.49%, Memory 98.49%, DRAM 53.75%
+```
+
+按之前一直采用的中位数记录方式，可记为：
+
+```text
+Duration = 64.38 ms
+Compute Throughput = 98.49%
+Memory Throughput = 98.49%
+DRAM Throughput = 53.75%
+```
+
+`32x32 tile + 1x16 register block` 的三次结果为：
+
+```text
+86.27 ms
+86.02 ms
+84.95 ms
+```
+
+其中位数结果为：
+
+```text
+Duration = 86.02 ms
+Compute Throughput = 98.28%
+Memory Throughput = 98.28%
+DRAM Throughput = 40.15%
+```
+
+`32x32 tile + 1x4 register block` 的结果为：
+
+```text
+Duration = 79.81 ms
+Compute Throughput = 97.43%
+Memory Throughput = 97.43%
+DRAM Throughput = 44.57%
+```
+
+把这几组结果放在一起之后，可以得到当前 `32x32 tile` 这条线上的明确排序：
+
+1. `1x8` 最好
+2. `1x4` 次之
+3. `1x16` 更差
+
+这说明在 `32x32 tile` 下，`register block` 的最佳选择同样不是“越大越好”。  
+从 `1x4` 增加到 `1x8` 时，kernel duration 继续下降；但再扩大到 `1x16`，性能反而明显退化，说明线程块内部的并行度、寄存器压力和调度效率之间依然存在一个甜点，而当前甜点更接近 `1x8`。
+
+更重要的是，这轮结果已经足以推翻之前对 `32x32` 的简单判断。  
+之前 `Shared 32x32` 表现不佳，只能说明“没有合适 register block 的 32x32”不理想；但现在的数据已经说明：
+
+```text
+32x32 tile + 合适的 register block
+可以明显优于之前的 16x16 最优版本。
+```
+
+前面记录中的最佳版本是：
+
+```text
+Shared 16x16 + register block 1x8
+Duration = 91.45 ms
+```
+
+而这次新的最好结果是：
+
+```text
+Shared 32x32 + register block 1x8
+Duration = 64.38 ms
+```
+
+两者相比：
+
+```text
+Speedup = 91.45 / 64.38 = 1.42
+Improvement(%) = (91.45 - 64.38) / 91.45 * 100% = 29.60%
+```
+
+如果相对最初记录中的 `Naive = 700.49 ms` 来看，则有：
+
+```text
+Speedup = 700.49 / 64.38 = 10.88
+Improvement(%) = (700.49 - 64.38) / 700.49 * 100% = 90.81%
+```
+
+这说明在当时那一轮 `ncu basic` profiling 视角下，项目里的“阶段性最佳版本”已经发生了变化。  
+至少在那一轮实现、那套测试数据和当时的 profiling 口径下，新的最优候选已经变成：
+
+```text
+Shared 32x32 + register block 1x8
+```
+
+这轮实验还有一个很重要的观察点：  
+`32x32 + 1x8` 的 `Compute Throughput` 和 `Memory Throughput` 都已经接近 `98.5%`，但 `DRAM Throughput` 仍然没有被完全打满。这说明当前 kernel 的收益已经不再只是“多吃一点显存带宽”这么简单，而更可能来自：
+
+- 更高效的片上数据复用
+- 更合适的线程块组织方式
+- 更合理的 register block 粒度
+
+因此，下一步最值得深入分析的对象，也应该从之前的 `16x16 + 1x8` 切换为现在的：
+
+- `32x32 + 1x8`
+
+后续如果继续做 Nsight Compute 深挖，建议重点关注：
+
+- occupancy
+- register pressure
+- shared memory 访问模式
+- bank conflict
+- source counters
+- warp state / stall 原因
+
+### 锁频后的实验规程调整
+
+需要特别说明的是：从这一节开始，下面记录的时间数据不再是前面 `Nsight Compute Duration` 的 profiling 结果，而是我在统一锁频规程下，使用 `cudaEvent` 记录得到的 benchmark 时间。
+
+也就是说，README 到这里开始分成两条并行线索：
+
+- 前面的内容主要是 `ncu` 视角下的 profiling 记录，用来分析阶段性优化方向和瓶颈变化
+- 从这一节开始，主要记录统一锁频条件下的 `cudaEvent` benchmark 结果，用来做手写 kernel 与 `cuBLAS` 的正式性能对比
+
+因此，后面出现的 `36.397 ms`、`13.6834 ms` 这类数字，不应该和前文 `700.49 ms`、`91.45 ms`、`64.38 ms` 这些 `ncu Duration` 直接混在一起做绝对比较。
+
+在继续做 benchmark 时，我发现单纯使用 `cudaEvent` 做多次测试仍然会遇到比较明显的波动。进一步排查后，确认主要问题不在 kernel 正确性，而在 GPU 的动态频率策略，尤其是 `memory clock` 的降档会直接拉高 kernel time。
+
+因此，这一阶段我开始尝试在 Windows 侧使用 `nvidia-smi` 设置 GPU 核心锁频目标，并在 WSL 中运行程序。实验过程中逐步形成了下面这套更稳定的规程：
+
+- 在 Windows 侧先设置核心锁频目标
+- 在 WSL 中确认当前 `graphics clock` 和 `memory clock`
+- 在正式测试前，先进行 `5` 次 warmup
+- 正式 benchmark 采用 `9` 次测试并记录中位数
+
+这一轮实验里，我最终确定的正式档位不是 `2550` 或 `2700`，而是：
+
+```text
+Lock target: 2850 MHz
+```
+
+需要说明的是，这个数值是“目标锁频值”，并不等于 GPU 实际运行时始终稳定在 `2850 MHz`。实测中可以看到，核心频率通常会因为功耗墙或平台限制，实际落在：
+
+```text
+2715 ~ 2730 MHz
+```
+
+但和 `2550`、`2700` 这两个目标档位相比，`2850` 对应的整体运行状态更稳定。结合观测结果来看，真正让 benchmark 稳定下来的关键，很可能不是核心频率本身更高，而是：
+
+```text
+2850 这个目标档位更容易把 memory clock 保持在高频状态
+```
+
+也就是说，`2850` 的价值不在于“GPU 真正跑到了 2850 MHz”，而在于它让整张卡在当前平台上更容易进入一个对 benchmark 更友好的稳定状态。
+
+### 手写 kernel 在正式档位下的结果
+
+在将锁频目标固定为 `2850 MHz`，并采用“锁频后直接进入测试、正式测试 `9` 次取中位数”这套规程后，主版本 `[matrix_product.cu](/home/ngsxz/cuda_study/matrix_product.cu)` 的结果稳定在：
+
+```text
+Median kernel time ≈ 36.4 ms
+```
+
+其中一轮代表性结果如下：
+
+```text
+Median kernel time: 36.397 ms
+The kernel time for these tests:
+35.922 ms
+35.9794 ms
+36.2692 ms
+36.2906 ms
+36.397 ms
+36.4199 ms
+36.4203 ms
+36.4317 ms
+36.4549 ms
+```
+
+这说明在当前实验条件下，手写 kernel 的主体分布已经相当集中，大多数样本都能稳定落在 `36.2 ~ 36.5 ms` 这一带。
+
+### cuBLAS 对照结果
+
+在同样的锁频目标 `2850 MHz` 下，我也对 `[cublasSgemm.cu](/home/ngsxz/cuda_study/cublasSgemm.cu)` 做了同样规程的 benchmark。该版本同样采用：
+
+- 锁频后直接进入测试
+- 正式测试 `9` 次
+- 记录中位数
+
+代表性结果如下：
+
+```text
+Median kernel time: 13.6834 ms
+13.4063 ms
+13.4511 ms
+13.4814 ms
+13.4832 ms
+13.6834 ms
+13.7177 ms
+13.7932 ms
+13.8423 ms
+13.8459 ms
+```
+
+这说明在当前正式实验档位下，`cuBLAS SGEMM` 的稳定表现大约为：
+
+```text
+Median kernel time ≈ 13.7 ms
+```
+
+### 当前正式结论
+
+在正式实验规程和统一锁频目标下：
+
+```text
+Handwritten kernel: 36.397 ms
+cuBLAS SGEMM:      13.6834 ms
+```
+
+因此，当前手写版本相对 `cuBLAS` 的性能比例约为：
+
+```text
+13.6834 / 36.397 = 37.6%
+```
+
+也就是说，在目前这版实现、这套测试数据以及这套锁频规程下，我的手写矩阵乘法大约达到了 `cuBLAS` 的：
+
+```text
+37% ~ 38%
+```
+
+这一阶段最重要的收获不是继续把绝对时间压到最低，而是明确了下面几点：
+
+- benchmark 的主要波动源来自 `memory clock` 降档，而不是单纯的 kernel 写法错误
+- 锁频时应该关心“哪一个锁频目标能带来最稳定的整体运行状态”，而不是只看目标值本身
+- 在当前机器上，`2850 MHz` 这个目标锁频值虽然实际跑不到 `2850`，但它对应的实验结果最稳定，因此适合作为正式对照实验档位
+- 在统一实验条件下，当前手写 kernel 已经能够稳定达到 `cuBLAS` 的约 `37% ~ 38%`
