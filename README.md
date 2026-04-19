@@ -751,7 +751,7 @@ Shared 32x32 + register block 1x8
 - 前面的内容主要是 `ncu` 视角下的 profiling 记录，用来分析阶段性优化方向和瓶颈变化
 - 从这一节开始，主要记录统一锁频条件下的 `cudaEvent` benchmark 结果，用来做手写 kernel 与 `cuBLAS` 的正式性能对比
 
-因此，后面出现的 `36.397 ms`、`13.6834 ms` 这类数字，不应该和前文 `700.49 ms`、`91.45 ms`、`64.38 ms` 这些 `ncu Duration` 直接混在一起做绝对比较。
+因此，后面出现的 `33 ms`、`13 ms` 这类 benchmark 数字，不应该和前文 `700.49 ms`、`91.45 ms`、`64.38 ms` 这些 `ncu Duration` 直接混在一起做绝对比较。
 
 在继续做 benchmark 时，我发现单纯使用 `cudaEvent` 做多次测试仍然会遇到比较明显的波动。进一步排查后，确认主要问题不在 kernel 正确性，而在 GPU 的动态频率策略，尤其是 `memory clock` 的降档会直接拉高 kernel time。
 
@@ -784,29 +784,67 @@ Lock target: 2850 MHz
 
 ### 手写 kernel 在正式档位下的结果
 
-在将锁频目标固定为 `2850 MHz`，并采用“锁频后直接进入测试、正式测试 `9` 次取中位数”这套规程后，主版本 `[matrix_product.cu](/home/ngsxz/cuda_study/matrix_product.cu)` 的结果稳定在：
+在将锁频目标固定为 `2850 MHz`，并采用“锁频后直接进入测试、正式测试 `9` 次取中位数”这套规程后，我先得到了一版稳定在 `36.4 ms` 左右的主版本 `[matrix_product.cu](/home/ngsxz/cuda_study/matrix_product.cu)`。
+
+但在继续围绕 `shared memory` 布局、`block shape` 和实现特化做调整之后，最终我把当前最优实现单独收敛成了 `[matrix_product_tuned.cu](/home/ngsxz/cuda_study/matrix_product_tuned.cu)`。这版不是继续保留通用参数探索框架，而是把目前扫出来的最优组合专门写成了更精简的 tuned 版本。
+
+这版 tuned kernel 当前的稳定 benchmark 结果大约为：
 
 ```text
-Median kernel time ≈ 36.4 ms
+Median kernel time ≈ 33.16 ms
 ```
 
-其中一轮代表性结果如下：
+连续三轮独立测试如下：
 
 ```text
-Median kernel time: 36.397 ms
+Median kernel time: 33.1572 ms
 The kernel time for these tests:
-35.922 ms
-35.9794 ms
-36.2692 ms
-36.2906 ms
-36.397 ms
-36.4199 ms
-36.4203 ms
-36.4317 ms
-36.4549 ms
+33.1417 ms
+33.1424 ms
+33.1469 ms
+33.156 ms
+33.1572 ms
+33.1771 ms
+33.7164 ms
+36.17 ms
+36.4129 ms
 ```
 
-这说明在当前实验条件下，手写 kernel 的主体分布已经相当集中，大多数样本都能稳定落在 `36.2 ~ 36.5 ms` 这一带。
+```text
+Median kernel time: 33.1533 ms
+The kernel time for these tests:
+33.1406 ms
+33.15 ms
+33.15 ms
+33.1525 ms
+33.1533 ms
+33.1568 ms
+33.1572 ms
+33.1656 ms
+33.6409 ms
+```
+
+```text
+Median kernel time: 33.1596 ms
+The kernel time for these tests:
+33.1443 ms
+33.1444 ms
+33.1482 ms
+33.1513 ms
+33.1596 ms
+33.1685 ms
+33.1753 ms
+33.322 ms
+33.6768 ms
+```
+
+从这三轮结果可以看到，这版 tuned kernel 的主体分布几乎完全锁在 `33.14 ~ 33.18 ms` 这一带，中位数之间的差异已经非常小。虽然尾部仍然会出现少量慢点，但它们已经很难撼动主结论，因此当前可以比较有把握地把：
+
+```text
+matrix_product_tuned.cu
+```
+
+视为我目前的正式最优实现。
 
 ### cuBLAS 对照结果
 
@@ -842,25 +880,50 @@ Median kernel time ≈ 13.7 ms
 在正式实验规程和统一锁频目标下：
 
 ```text
-Handwritten kernel: 36.397 ms
+Handwritten kernel (tuned): 33.1572 ms
 cuBLAS SGEMM:      13.6834 ms
 ```
 
 因此，当前手写版本相对 `cuBLAS` 的性能比例约为：
 
 ```text
-13.6834 / 36.397 = 37.6%
+13.6834 / 33.1572 = 41.3%
 ```
 
 也就是说，在目前这版实现、这套测试数据以及这套锁频规程下，我的手写矩阵乘法大约达到了 `cuBLAS` 的：
 
 ```text
-37% ~ 38%
+41%
 ```
 
-这一阶段最重要的收获不是继续把绝对时间压到最低，而是明确了下面几点：
+除此之外，我还对 `[matrix_product_tuned.cu](/home/ngsxz/cuda_study/matrix_product_tuned.cu)` 跑了一轮 `ncu --set full`。这次 profiling 给出的结论和前面的判断是高度一致的：
+
+- `Compute Throughput = 99.01%`
+- `Memory Throughput = 99.01%`
+- `DRAM Throughput = 30.10%`
+- `Shared Store Bank Conflicts Est. Speedup = 14.96%`
+- `Mio Throttle Stalls` 仍然占主要 stall 原因之一
+
+这说明 tuned 版当前已经不是简单地被外部显存带宽卡住，而更像是：
+
+```text
+shared store 路径仍然不够理想，
+尤其是把 tile 写入 shared memory 时还有比较明显的额外 wavefront / bank conflict 开销
+```
+
+也就是说，当前最值得继续深挖的方向，不是再回去怀疑 occupancy 或 DRAM，而是继续围绕：
+
+- `Bs` 的 shared store pattern
+- `MIO` 管线压力
+- `shared memory` 写入阶段的 bank conflict / excessive wavefront
+
+来做后续优化。
+
+到目前为止，这一阶段最重要的收获主要有下面几点：
 
 - benchmark 的主要波动源来自 `memory clock` 降档，而不是单纯的 kernel 写法错误
 - 锁频时应该关心“哪一个锁频目标能带来最稳定的整体运行状态”，而不是只看目标值本身
 - 在当前机器上，`2850 MHz` 这个目标锁频值虽然实际跑不到 `2850`，但它对应的实验结果最稳定，因此适合作为正式对照实验档位
-- 在统一实验条件下，当前手写 kernel 已经能够稳定达到 `cuBLAS` 的约 `37% ~ 38%`
+- 用通用框架扫参数是有价值的，但最终最优成绩仍然更适合通过专门的 tuned 实现来兑现
+- 在统一实验条件下，当前手写 kernel 已经能够稳定达到 `cuBLAS` 的约 `41%`
+- 即使已经进入 `33 ms` 级别，当前 tuned kernel 的主要可见瓶颈仍然是 `shared store bank conflict`，这说明后面继续优化依然有明确抓手

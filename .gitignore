@@ -2,6 +2,7 @@
 matrix_product
 matrix_product_naive
 matrix_product_32_8
+matrix_product_tuned
 vector_add
 mm_naive
 mm_shared
