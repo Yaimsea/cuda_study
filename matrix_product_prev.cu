@@ -36,20 +36,16 @@ const int y_blockSize = 64;
 const int tileSize = 64; 
 static_assert(tileSize == std::max(x_blockSize, y_blockSize));
 static_assert(x_blockSize % y_blockSize == 0 || y_blockSize % x_blockSize == 0);
-const int threadNum = 128;
-const int As_x_loadSize = 4;
-const int As_y_loadSize = 4;
+const int threadNum = 256;
+const int As_x_loadSize = 1;
+const int As_y_loadSize = 8;
 static_assert(x_blockSize % As_x_loadSize == 0);
 static_assert(y_blockSize % As_y_loadSize == 0);
-static_assert(As_x_loadSize % 4 == 0);
-static_assert(M1 % 4 == 0);
-const int Bs_x_loadSize = 4;
-const int Bs_y_loadSize = 4;
+const int Bs_x_loadSize = 8;
+const int Bs_y_loadSize = 1;
 static_assert(x_blockSize % Bs_x_loadSize == 0);
 static_assert(y_blockSize % Bs_y_loadSize == 0);
-static_assert(Bs_x_loadSize % 4 == 0);
-static_assert(M2 % 4 == 0);
-const int x_computeSize = 2;
+const int x_computeSize = 1;
 const int y_computeSize = 8;
 static_assert(x_blockSize % x_computeSize == 0);
 static_assert(y_blockSize % y_computeSize == 0);
@@ -79,17 +75,16 @@ __global__ void matrixProduct(const float *A,const float *B,float *C,int tileNum
             int bAidx = i * tileSize + j * x_blockSize + As_loadIdx * As_x_loadSize;
             int bAidy = blockIdx.y * y_blockSize + As_loadIdy * As_y_loadSize;
             for(int Ridy = 0; Ridy < As_y_loadSize; ++Ridy)
-                for(int Ridx = 0; Ridx < As_x_loadSize; Ridx += 4)
+                for(int Ridx = 0; Ridx < As_x_loadSize; ++Ridx)
                 {
                     int Asidx = j * x_blockSize + As_loadIdx * As_x_loadSize + Ridx;
                     int Asidy = As_loadIdy * As_y_loadSize + Ridy;
                     int Aidx = bAidx + Ridx;
                     int Aidy = bAidy + Ridy;
                     if(Aidx >= M1 || Aidy >= N)
-                        reinterpret_cast<float4*>(As[Asidy])[Asidx / 4] = {0.0f, 0.0f, 0.0f, 0.0f};
+                        As[Asidy][Asidx] = 0.0f;
                     else
-                        reinterpret_cast<float4*>(As[Asidy])[Asidx / 4] = 
-                        reinterpret_cast<const float4*>(A)[(Aidy * M1 + Aidx) / 4];
+                        As[Asidy][Asidx] = A[Aidy * M1 + Aidx];
                 }
         }
         for(int j = 0; j < y_tileLoadPasses; ++j)
@@ -97,17 +92,16 @@ __global__ void matrixProduct(const float *A,const float *B,float *C,int tileNum
             int bBidx = blockIdx.x * x_blockSize + Bs_loadIdx * Bs_x_loadSize;
             int bBidy = i * tileSize + j * y_blockSize + Bs_loadIdy * Bs_y_loadSize;
             for(int Ridy = 0; Ridy < Bs_y_loadSize; ++Ridy)
-                for(int Ridx = 0; Ridx < Bs_x_loadSize; Ridx += 4)
+                for(int Ridx = 0; Ridx < Bs_x_loadSize; ++Ridx)
                 {
                     int Bsidx = Bs_loadIdx * Bs_x_loadSize + Ridx;
                     int Bsidy = j * y_blockSize + Bs_loadIdy * Bs_y_loadSize + Ridy;
                     int Bidx = bBidx + Ridx;
                     int Bidy = bBidy + Ridy;
                     if(Bidx >= M2 || Bidy >= M1)
-                        reinterpret_cast<float4*>(Bs[Bsidy])[Bsidx / 4] = {0.0f, 0.0f, 0.0f, 0.0f};
+                        Bs[Bsidy][Bsidx] = 0.0f;
                     else
-                        reinterpret_cast<float4*>(Bs[Bsidy])[Bsidx / 4] = 
-                        reinterpret_cast<const float4*>(B)[(Bidy * M2 + Bidx) / 4];
+                        Bs[Bsidy][Bsidx] = B[Bidy * M2 + Bidx];
                 }
         }
         __syncthreads();

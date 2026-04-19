@@ -782,148 +782,168 @@ Lock target: 2850 MHz
 
 也就是说，`2850` 的价值不在于“GPU 真正跑到了 2850 MHz”，而在于它让整张卡在当前平台上更容易进入一个对 benchmark 更友好的稳定状态。
 
-### 手写 kernel 在正式档位下的结果
+### 手写 kernel 在正式档位下的新结果
 
-在将锁频目标固定为 `2850 MHz`，并采用“锁频后直接进入测试、正式测试 `9` 次取中位数”这套规程后，我先得到了一版稳定在 `36.4 ms` 左右的主版本 `[matrix_product.cu](/home/ngsxz/cuda_study/matrix_product.cu)`。
+在把 `shared memory` 的标量搬运逐步改成 `float4` 向量化访存之后，当前主线已经不再是之前那版 `33 ms` 级别的 tuned kernel 了。
 
-但在继续围绕 `shared memory` 布局、`block shape` 和实现特化做调整之后，最终我把当前最优实现单独收敛成了 `[matrix_product_tuned.cu](/home/ngsxz/cuda_study/matrix_product_tuned.cu)`。这版不是继续保留通用参数探索框架，而是把目前扫出来的最优组合专门写成了更精简的 tuned 版本。
+这一轮最关键的变化主要有两点：
 
-这版 tuned kernel 当前的稳定 benchmark 结果大约为：
+- `A` 和 `B` 都改成了 `float4` 的 global load + shared store
+- 当前最强配置不再是“每线程 `1 x 8` 计算”，而是：
 
 ```text
-Median kernel time ≈ 33.16 ms
+x_blockSize = 32
+y_blockSize = 64
+tileSize = 64
+threadNum = 128
+As_x_loadSize = 4, As_y_loadSize = 4
+Bs_x_loadSize = 4, Bs_y_loadSize = 4
+x_computeSize = 2, y_computeSize = 8
 ```
 
-连续三轮独立测试如下：
+在这一组参数下，当前主线版本 `matrix_product.cu` 已经能够稳定跑进 `21 ms` 左右。例如：
 
 ```text
-Median kernel time: 33.1572 ms
+Median kernel time: 21.0433 ms
 The kernel time for these tests:
-33.1417 ms
-33.1424 ms
-33.1469 ms
-33.156 ms
-33.1572 ms
-33.1771 ms
-33.7164 ms
-36.17 ms
-36.4129 ms
+20.9074 ms
+20.9671 ms
+20.9799 ms
+20.9933 ms
+21.0433 ms
+21.2454 ms
+21.2497 ms
+21.3133 ms
+21.4057 ms
 ```
+
+在此基础上，我又把不再需要的通用路径继续剥离，收敛成了当前的 `matrix_product_tuned.cu`。也就是说，现在项目里的文件分工更接近：
+
+- `matrix_product.cu`：当前 `float4` 主线版本
+- `matrix_product_tuned.cu`：在这条主线上继续做参数专用化和路径剥离之后的 tuned 版本
+
+这版 tuned 结果进一步进入了 `20 ms` 档，但从多轮独立测试来看，最保守也最可信的代表值更接近：
 
 ```text
-Median kernel time: 33.1533 ms
-The kernel time for these tests:
-33.1406 ms
-33.15 ms
-33.15 ms
-33.1525 ms
-33.1533 ms
-33.1568 ms
-33.1572 ms
-33.1656 ms
-33.6409 ms
+Median kernel time ≈ 20.6 ms
 ```
-
-```text
-Median kernel time: 33.1596 ms
-The kernel time for these tests:
-33.1443 ms
-33.1444 ms
-33.1482 ms
-33.1513 ms
-33.1596 ms
-33.1685 ms
-33.1753 ms
-33.322 ms
-33.6768 ms
-```
-
-从这三轮结果可以看到，这版 tuned kernel 的主体分布几乎完全锁在 `33.14 ~ 33.18 ms` 这一带，中位数之间的差异已经非常小。虽然尾部仍然会出现少量慢点，但它们已经很难撼动主结论，因此当前可以比较有把握地把：
-
-```text
-matrix_product_tuned.cu
-```
-
-视为我目前的正式最优实现。
-
-### cuBLAS 对照结果
-
-在同样的锁频目标 `2850 MHz` 下，我也对 `[cublasSgemm.cu](/home/ngsxz/cuda_study/cublasSgemm.cu)` 做了同样规程的 benchmark。该版本同样采用：
-
-- 锁频后直接进入测试
-- 正式测试 `9` 次
-- 记录中位数
 
 代表性结果如下：
 
 ```text
-Median kernel time: 13.6834 ms
-13.4063 ms
-13.4511 ms
-13.4814 ms
-13.4832 ms
-13.6834 ms
-13.7177 ms
-13.7932 ms
-13.8423 ms
-13.8459 ms
+Median kernel time: 20.1543 ms
+The kernel time for these tests:
+20.0679 ms
+20.0701 ms
+20.1174 ms
+20.1277 ms
+20.1543 ms
+20.3902 ms
+20.5478 ms
+20.5554 ms
+20.5724 ms
 ```
 
-这说明在当前正式实验档位下，`cuBLAS SGEMM` 的稳定表现大约为：
+```text
+Median kernel time: 20.5583 ms
+The kernel time for these tests:
+20.0764 ms
+20.2141 ms
+20.2283 ms
+20.4803 ms
+20.5583 ms
+20.5926 ms
+20.695 ms
+20.8499 ms
+20.8735 ms
+```
 
 ```text
-Median kernel time ≈ 13.7 ms
+Median kernel time: 20.6282 ms
+The kernel time for these tests:
+20.1436 ms
+20.2153 ms
+20.6139 ms
+20.6218 ms
+20.6282 ms
+20.647 ms
+20.6687 ms
+20.786 ms
+21.1951 ms
+```
+
+也就是说，这版 tuned kernel 在当前正式规程下已经基本稳定在 `20.5 ~ 20.6 ms` 这一带。第一轮虽然偶尔能跑到 `20.15 ms`，但从后续重测来看，把 `20.6 ms` 视为当前更稳妥的正式成绩会更合适。
+
+### wavefront 与 bank conflict 的新理解
+
+这一轮实验里还有一个很重要的认识变化：  
+以前我一直在从“整个 warp 的 32 个线程有没有访问同一个 bank”这个角度理解 bank conflict，但在真正看 `float4` 的 shared store 之后，我发现更关键的是：
+
+```text
+硬件仲裁的粒度不是把整个 warp 一次性看成一整块，
+而是按 wavefront 分批处理。
+```
+
+对于当前这版 `float4` 写入路径来说，一个 `float4 store = 16B`，而硬件对 shared memory 的处理更接近按 `128B` 的 wavefront 分批发出。  
+这意味着，虽然从整个 warp 的视角看，不同线程仍然可能落到同一列甚至重复使用同一组 bank 编号，但真正参与同一批次仲裁的只是单个 `128B wavefront`，而在同一个 `128B wavefront` 里，访问的正好是同一行的元素，不存在所谓的 `4-way bank conflict` 。
+
+也正因为如此，当前 `float4` 版最重要的收益之一并不是“数学上把冲突完全消灭了”，而是：
+
+```text
+把之前那种明显的、结构性的 shared-store bank conflict 打散了。
+```
+
+更具体地说，旧版标量 store 的 `Bs` 装载路径会形成非常重的结构性冲突；而当前 `float4` 版本虽然不敢轻易说“所有机器级 conflict 都绝对消失了”，但至少已经避开了之前那种一眼就能看出来的大冲突。这也是它能够一下子从 `33 ms` 档推进到 `20 ms` 档的重要原因之一。
+
+### cuBLAS 对照结果
+
+在同样的锁频目标 `2850 MHz` 下，`cublasSgemm.cu` 的代表性结果如下：
+
+```text
+Median kernel time: 13.4553 ms
+13.3838 ms
+13.3966 ms
+13.3987 ms
+13.4425 ms
+13.4553 ms
+13.4693 ms
+13.5382 ms
+13.6713 ms
+13.7428 ms
+```
+
+因此，在当前正式实验档位下，`cuBLAS SGEMM` 的稳定表现大约为：
+
+```text
+Median kernel time ≈ 13.46 ms
 ```
 
 ### 当前正式结论
 
-在正式实验规程和统一锁频目标下：
+在统一锁频目标和统一 benchmark 规程下，目前更合理的正式对比应写成：
 
 ```text
-Handwritten kernel (tuned): 33.1572 ms
-cuBLAS SGEMM:      13.6834 ms
+Handwritten kernel (tuned): ≈ 20.6 ms
+cuBLAS SGEMM:               ≈ 13.46 ms
 ```
 
-因此，当前手写版本相对 `cuBLAS` 的性能比例约为：
+因此，当前手写版本相对 `cuBLAS` 的性能比例大约为：
 
 ```text
-13.6834 / 33.1572 = 41.3%
+13.4553 / 20.6 ≈ 65%
 ```
 
-也就是说，在目前这版实现、这套测试数据以及这套锁频规程下，我的手写矩阵乘法大约达到了 `cuBLAS` 的：
+也就是说，在目前这版实现、这套测试数据以及这套正式规程下，我的手写矩阵乘法已经达到了同卡 `cuBLAS` 的大约：
 
 ```text
-41%
+65%
 ```
-
-除此之外，我还对 `[matrix_product_tuned.cu](/home/ngsxz/cuda_study/matrix_product_tuned.cu)` 跑了一轮 `ncu --set full`。这次 profiling 给出的结论和前面的判断是高度一致的：
-
-- `Compute Throughput = 99.01%`
-- `Memory Throughput = 99.01%`
-- `DRAM Throughput = 30.10%`
-- `Shared Store Bank Conflicts Est. Speedup = 14.96%`
-- `Mio Throttle Stalls` 仍然占主要 stall 原因之一
-
-这说明 tuned 版当前已经不是简单地被外部显存带宽卡住，而更像是：
-
-```text
-shared store 路径仍然不够理想，
-尤其是把 tile 写入 shared memory 时还有比较明显的额外 wavefront / bank conflict 开销
-```
-
-也就是说，当前最值得继续深挖的方向，不是再回去怀疑 occupancy 或 DRAM，而是继续围绕：
-
-- `Bs` 的 shared store pattern
-- `MIO` 管线压力
-- `shared memory` 写入阶段的 bank conflict / excessive wavefront
-
-来做后续优化。
 
 到目前为止，这一阶段最重要的收获主要有下面几点：
 
-- benchmark 的主要波动源来自 `memory clock` 降档，而不是单纯的 kernel 写法错误
-- 锁频时应该关心“哪一个锁频目标能带来最稳定的整体运行状态”，而不是只看目标值本身
-- 在当前机器上，`2850 MHz` 这个目标锁频值虽然实际跑不到 `2850`，但它对应的实验结果最稳定，因此适合作为正式对照实验档位
-- 用通用框架扫参数是有价值的，但最终最优成绩仍然更适合通过专门的 tuned 实现来兑现
-- 在统一实验条件下，当前手写 kernel 已经能够稳定达到 `cuBLAS` 的约 `41%`
-- 即使已经进入 `33 ms` 级别，当前 tuned kernel 的主要可见瓶颈仍然是 `shared store bank conflict`，这说明后面继续优化依然有明确抓手
+- benchmark 的主要波动源来自 `memory clock` 降档，而不是单纯的 kernel 正确性问题
+- 锁频时应该关心“哪一个目标档位能带来最稳定的整体运行状态”，而不是只看名义频率
+- `2850 MHz` 这个目标锁频值虽然实际跑不到 `2850`，但它对应的实验结果最稳定，因此适合作为正式对照实验档位
+- 旧版的主要瓶颈确实和 `shared store bank conflict / excessive wavefront` 强相关，而 `float4` 的引入显著改善了这条路径
+- 用通用框架验证方向仍然有价值，但真正的成绩兑现还是更依赖后面的专门 tuned 实现
+- 在统一实验条件下，当前手写 kernel 已经能够稳定达到 `cuBLAS` 的约 `65%`

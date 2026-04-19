@@ -22,8 +22,8 @@
         } \
     }while(0)
 
-const int testNum = 1;
-const int warmupNum = 3;
+const int testNum = 9;
+const int warmupNum = 5;
 const float eps = 1e-4;
 const int N = 4096;
 const int M1 = 4096;
@@ -36,86 +36,99 @@ const int y_blockSize = 64;
 const int tileSize = 64; 
 static_assert(tileSize == std::max(x_blockSize, y_blockSize));
 static_assert(x_blockSize % y_blockSize == 0 || y_blockSize % x_blockSize == 0);
-const int y_registerSize = 8;
-static_assert(y_blockSize % y_registerSize == 0);
+const int threadNum = 128;
+const int As_x_loadSize = 4;
+const int As_y_loadSize = 4;
+static_assert(x_blockSize % As_x_loadSize == 0);
+static_assert(y_blockSize % As_y_loadSize == 0);
+static_assert(As_x_loadSize % 4 == 0);
+static_assert(M1 % 4 == 0);
+const int Bs_x_loadSize = 4;
+const int Bs_y_loadSize = 4;
+static_assert(x_blockSize % Bs_x_loadSize == 0);
+static_assert(y_blockSize % Bs_y_loadSize == 0);
+static_assert(Bs_x_loadSize % 4 == 0);
+static_assert(M2 % 4 == 0);
+const int x_computeSize = 2;
+const int y_computeSize = 8;
+static_assert(x_blockSize % x_computeSize == 0);
+static_assert(y_blockSize % y_computeSize == 0);
+static_assert(As_x_loadSize * As_y_loadSize == Bs_x_loadSize * Bs_y_loadSize);
+static_assert(As_x_loadSize * As_y_loadSize == x_computeSize * y_computeSize);
+static_assert(As_x_loadSize * As_y_loadSize * threadNum == x_blockSize * y_blockSize);
 const int As_padding = 0;
 const int Bs_padding = 0;
-/*
-    The condition must be met that
-        tileSize == max(x_blockSize, y_blockSize) ,
-        x_blockSize % y_blockSize == 0 or y_blockSize % x_blockSize == 0,
-        x_blockSize % x_registerSize == 0 and
-        y_blockSize % y_registerSize == 0 .
-    It is very important!
-
-    One block computes an output tile of C with shape
-    (y_blockSize, x_blockSize).
-
-    One thread computes an output tile with shape
-    (y_registerSize, x_registerSize).
-
-    Therefore, the thread block shape should be
-    (x_blockSize / x_registerSize, y_blockSize / y_registerSize).
-*/
 const bool debugEnabled = true;
 
-__global__ void matrixProduct(const float *A,const float *B,float *C,int tileNum,int x_tileLoadPasses)
+__global__ void matrixProduct(const float *A,const float *B,float *C,int tileNum,int x_tileLoadPasses,int y_tileLoadPasses)
 {
     __shared__ float As[y_blockSize][tileSize + As_padding];
     __shared__ float Bs[tileSize][x_blockSize + Bs_padding];
-    float sum[y_registerSize] = {0.0f};
+    float sum[y_computeSize][x_computeSize] = {0.0f};
+    int As_loadIdx = threadIdx.x % (x_blockSize / As_x_loadSize);
+    int As_loadIdy = threadIdx.x / (x_blockSize / As_x_loadSize);
+    int Bs_loadIdx = threadIdx.x % (x_blockSize / Bs_x_loadSize);
+    int Bs_loadIdy = threadIdx.x / (x_blockSize / Bs_x_loadSize);
+    int computeIdx = threadIdx.x % (x_blockSize / x_computeSize);
+    int computeIdy = threadIdx.x / (x_blockSize / x_computeSize);
 
     for(int i = 0; i < tileNum; ++i)
     {
         for(int j = 0; j < x_tileLoadPasses; ++j)
         {
-            int bAidx = i * tileSize + j * x_blockSize + threadIdx.x;
-            int bAidy = blockIdx.y * y_blockSize + threadIdx.y * y_registerSize;
-            for(int Ridy = 0; Ridy < y_registerSize; ++Ridy)
+            int bAidx = i * tileSize + j * x_blockSize + As_loadIdx * As_x_loadSize;
+            int bAidy = blockIdx.y * y_blockSize + As_loadIdy * As_y_loadSize;
+            for(int Ridy = 0; Ridy < As_y_loadSize; ++Ridy)
+                for(int Ridx = 0; Ridx < As_x_loadSize; Ridx += 4)
+                {
+                    int Asidx = j * x_blockSize + As_loadIdx * As_x_loadSize + Ridx;
+                    int Asidy = As_loadIdy * As_y_loadSize + Ridy;
+                    int Aidx = bAidx + Ridx;
+                    int Aidy = bAidy + Ridy;
+                    if(Aidx >= M1 || Aidy >= N)
+                        reinterpret_cast<float4*>(As[Asidy])[Asidx / 4] = {0.0f, 0.0f, 0.0f, 0.0f};
+                    else
+                        reinterpret_cast<float4*>(As[Asidy])[Asidx / 4] = 
+                        reinterpret_cast<const float4*>(A)[(Aidy * M1 + Aidx) / 4];
+                }
+        }
+        int bBidx = blockIdx.x * x_blockSize + Bs_loadIdx * Bs_x_loadSize;
+        int bBidy = i * tileSize + Bs_loadIdy * Bs_y_loadSize;
+        for(int Ridy = 0; Ridy < Bs_y_loadSize; ++Ridy)
+            for(int Ridx = 0; Ridx < Bs_x_loadSize; Ridx += 4)
             {
-                int Asidx = j * x_blockSize + threadIdx.x;
-                int Asidy = threadIdx.y * y_registerSize + Ridy;
-                int Aidx = bAidx;
-                int Aidy = bAidy + Ridy;
-                if(Aidx >= M1 || Aidy >= N)
-                    As[Asidy][Asidx] = 0.0f;
+                int Bsidx = Bs_loadIdx * Bs_x_loadSize + Ridx;
+                int Bsidy = Bs_loadIdy * Bs_y_loadSize + Ridy;
+                int Bidx = bBidx + Ridx;
+                int Bidy = bBidy + Ridy;
+                if(Bidx >= M2 || Bidy >= M1)
+                    reinterpret_cast<float4*>(Bs[Bsidy])[Bsidx / 4] = {0.0f, 0.0f, 0.0f, 0.0f};
                 else
-                    As[Asidy][Asidx] = A[Aidy * M1 + Aidx];
+                    reinterpret_cast<float4*>(Bs[Bsidy])[Bsidx / 4] = 
+                    reinterpret_cast<const float4*>(B)[(Bidy * M2 + Bidx) / 4];
             }
-        }
-        int bBidx = blockIdx.x * x_blockSize + threadIdx.x;
-        int bBidy = i * tileSize + threadIdx.y * y_registerSize;
-        for(int Ridy = 0; Ridy < y_registerSize; ++Ridy)
-        {
-            int Bsidx = threadIdx.x;
-            int Bsidy = threadIdx.y * y_registerSize + Ridy;
-            int Bidx = bBidx;
-            int Bidy = bBidy + Ridy;
-            if(Bidx >= M2 || Bidy >= M1)
-                Bs[Bsidy][Bsidx] = 0.0f;
-            else
-                Bs[Bsidy][Bsidx] = B[Bidy * M2 + Bidx];
-        }
         __syncthreads();
         for(int j = 0; j < tileSize; ++j)
         {
-            for(int Ridy = 0; Ridy < y_registerSize; ++Ridy)
-            {
-                int Asidy = threadIdx.y * y_registerSize + Ridy;
-                int Bsidx = threadIdx.x;
-                sum[Ridy] += As[Asidy][j] * Bs[j][Bsidx];
-            }
+            for(int Ridy = 0; Ridy < y_computeSize; ++Ridy)
+                for(int Ridx = 0; Ridx < x_computeSize; ++Ridx)
+                {
+                    int Asidy = computeIdy * y_computeSize + Ridy;
+                    int Bsidx = computeIdx * x_computeSize + Ridx;
+                    sum[Ridy][Ridx] += As[Asidy][j] * Bs[j][Bsidx];
+                }
         }
         __syncthreads();
     }
 
-    for(int Ridy = 0; Ridy < y_registerSize; ++Ridy)
-    {
-        int Cidx = blockIdx.x * x_blockSize + threadIdx.x;
-        int Cidy = blockIdx.y * y_blockSize + threadIdx.y * y_registerSize + Ridy;
-        if(Cidx < M2 && Cidy < N)
-            C[Cidy * M2 + Cidx] = sum[Ridy];
-    }
+    for(int Ridy = 0; Ridy < y_computeSize; ++Ridy)
+        for(int Ridx = 0; Ridx < x_computeSize; ++Ridx)
+        {
+            int Cidx = blockIdx.x * x_blockSize + computeIdx * x_computeSize + Ridx;
+            int Cidy = blockIdx.y * y_blockSize + computeIdy * y_computeSize + Ridy;
+            if(Cidx < M2 && Cidy < N)
+                C[Cidy * M2 + Cidx] = sum[Ridy][Ridx];
+        }
     return;
 }
 
@@ -155,16 +168,17 @@ int main()
     CHECK_CUDA(cudaMemcpy(d_B, h_B, size2, cudaMemcpyHostToDevice));
     CHECK_CUDA(cudaMemcpy(d_C, h_C, size3, cudaMemcpyHostToDevice));
 
-    dim3 threadsPerBlock(x_blockSize, y_blockSize / y_registerSize);
+    int threadsPerBlock = threadNum;
     dim3 blockPerGird((M2 + x_blockSize - 1) / x_blockSize, (N + y_blockSize - 1) / y_blockSize);
     int tileNum = (M1 + tileSize - 1) / tileSize;
     int x_tileLoadPasses = std::max(1, y_blockSize / x_blockSize);
+    int y_tileLoadPasses = std::max(1, x_blockSize / y_blockSize);
 
     for(int i = 0; i < warmupNum; ++i)
     {
         CHECK_CUDA(cudaMemcpy(d_C, h_C, size3, cudaMemcpyHostToDevice));
 
-        matrixProduct<<<blockPerGird,threadsPerBlock>>>(d_A, d_B, d_C, tileNum, x_tileLoadPasses);
+        matrixProduct<<<blockPerGird,threadsPerBlock>>>(d_A, d_B, d_C, tileNum, x_tileLoadPasses, y_tileLoadPasses);
 
         CHECK_CUDA(cudaGetLastError());
         CHECK_CUDA(cudaDeviceSynchronize());
@@ -182,7 +196,7 @@ int main()
 
         CHECK_CUDA(cudaEventRecord(start));
 
-        matrixProduct<<<blockPerGird,threadsPerBlock>>>(d_A, d_B, d_C, tileNum, x_tileLoadPasses);
+        matrixProduct<<<blockPerGird,threadsPerBlock>>>(d_A, d_B, d_C, tileNum, x_tileLoadPasses, y_tileLoadPasses);
         
         CHECK_CUDA(cudaGetLastError());
 
