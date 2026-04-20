@@ -31,44 +31,40 @@ const int M2 = 4096;
 const int imod = 13;
 const int jmod = 17;
 const float base = 10.0f;
-const int x_blockSize = 64;
+const int x_blockSize = 32;
 const int y_blockSize = 64;
 const int tileSize = 64; 
 static_assert(tileSize == std::max(x_blockSize, y_blockSize));
 static_assert(x_blockSize % y_blockSize == 0 || y_blockSize % x_blockSize == 0);
 const int threadNum = 128;
 const int As_x_loadSize = 4;
-const int As_y_loadSize = 8;
+const int As_y_loadSize = 4;
 static_assert(x_blockSize % As_x_loadSize == 0);
 static_assert(y_blockSize % As_y_loadSize == 0);
 static_assert(As_x_loadSize % 4 == 0);
 static_assert(M1 % 4 == 0);
 const int Bs_x_loadSize = 4;
-const int Bs_y_loadSize = 8;
+const int Bs_y_loadSize = 4;
 static_assert(x_blockSize % Bs_x_loadSize == 0);
 static_assert(y_blockSize % Bs_y_loadSize == 0);
 static_assert(Bs_x_loadSize % 4 == 0);
 static_assert(M2 % 4 == 0);
-const int x_computeSize = 4;
+const int x_computeSize = 2;
 const int y_computeSize = 8;
 static_assert(x_blockSize % x_computeSize == 0);
 static_assert(y_blockSize % y_computeSize == 0);
 static_assert(As_x_loadSize * As_y_loadSize == Bs_x_loadSize * Bs_y_loadSize);
 static_assert(As_x_loadSize * As_y_loadSize == x_computeSize * y_computeSize);
 static_assert(As_x_loadSize * As_y_loadSize * threadNum == x_blockSize * y_blockSize);
-const int x_tileLoadPasses = std::max(1, y_blockSize / x_blockSize);
-const int y_tileLoadPasses = std::max(1, x_blockSize / y_blockSize);
 const int As_padding = 0;
 const int Bs_padding = 0;
 const bool debugEnabled = true;
 
-__global__ void matrixProduct(const float *A,const float *B,float *C,int tileNum)
+__global__ void matrixProduct(const float *A,const float *B,float *C,int tileNum,int x_tileLoadPasses,int y_tileLoadPasses)
 {
     __shared__ float As[y_blockSize][tileSize + As_padding];
     __shared__ float Bs[tileSize][x_blockSize + Bs_padding];
     float sum[y_computeSize][x_computeSize] = {0.0f};
-    float loadA[x_tileLoadPasses][As_y_loadSize][As_x_loadSize];
-    float loadB[y_tileLoadPasses][Bs_y_loadSize][Bs_x_loadSize];
     int As_loadIdx = threadIdx.x % (x_blockSize / As_x_loadSize);
     int As_loadIdy = threadIdx.x / (x_blockSize / As_x_loadSize);
     int Bs_loadIdx = threadIdx.x % (x_blockSize / Bs_x_loadSize);
@@ -76,79 +72,45 @@ __global__ void matrixProduct(const float *A,const float *B,float *C,int tileNum
     int computeIdx = threadIdx.x % (x_blockSize / x_computeSize);
     int computeIdy = threadIdx.x / (x_blockSize / x_computeSize);
 
-    for(int j = 0; j < x_tileLoadPasses; ++j)
-    {
-        int bAidx = j * x_blockSize + As_loadIdx * As_x_loadSize;
-        int bAidy = blockIdx.y * y_blockSize + As_loadIdy * As_y_loadSize;
-        for(int Ridy = 0; Ridy < As_y_loadSize; ++Ridy)
-            for(int Ridx = 0; Ridx < As_x_loadSize; Ridx += 4)
-            {
-                int Asidx = j * x_blockSize + As_loadIdx * As_x_loadSize + Ridx;
-                int Asidy = As_loadIdy * As_y_loadSize + Ridy;
-                int Aidx = bAidx + Ridx;
-                int Aidy = bAidy + Ridy;
-                if(Aidx >= M1 || Aidy >= N)
-                    reinterpret_cast<float4*>(As[Asidy])[Asidx / 4] = {0.0f, 0.0f, 0.0f, 0.0f};
-                else
-                    reinterpret_cast<float4*>(As[Asidy])[Asidx / 4] = 
-                    reinterpret_cast<const float4*>(A)[(Aidy * M1 + Aidx) / 4];
-            }
-    }
-    for(int j = 0; j < y_tileLoadPasses; ++j)
-    {
-        int bBidx = blockIdx.x * x_blockSize + Bs_loadIdx * Bs_x_loadSize;
-        int bBidy = j * y_blockSize + Bs_loadIdy * Bs_y_loadSize;
-        for(int Ridy = 0; Ridy < Bs_y_loadSize; ++Ridy)
-            for(int Ridx = 0; Ridx < Bs_x_loadSize; Ridx += 4)
-            {
-                int Bsidx = Bs_loadIdx * Bs_x_loadSize + Ridx;
-                int Bsidy = j * y_blockSize + Bs_loadIdy * Bs_y_loadSize + Ridy;
-                int Bidx = bBidx + Ridx;
-                int Bidy = bBidy + Ridy;
-                if(Bidx >= M2 || Bidy >= M1)
-                    reinterpret_cast<float4*>(Bs[Bsidy])[Bsidx / 4] = {0.0f, 0.0f, 0.0f, 0.0f};
-                else
-                    reinterpret_cast<float4*>(Bs[Bsidy])[Bsidx / 4] = 
-                    reinterpret_cast<const float4*>(B)[(Bidy * M2 + Bidx) / 4];
-            }
-    }
-    __syncthreads();
-
-    for(int i = 0; i < tileNum - 1; ++i)
+    for(int i = 0; i < tileNum; ++i)
     {
         for(int j = 0; j < x_tileLoadPasses; ++j)
         {
-            int bAidx = (i + 1) * tileSize + j * x_blockSize + As_loadIdx * As_x_loadSize;
+            int bAidx = i * tileSize + j * x_blockSize + As_loadIdx * As_x_loadSize;
             int bAidy = blockIdx.y * y_blockSize + As_loadIdy * As_y_loadSize;
             for(int Ridy = 0; Ridy < As_y_loadSize; ++Ridy)
                 for(int Ridx = 0; Ridx < As_x_loadSize; Ridx += 4)
                 {
+                    int Asidx = j * x_blockSize + As_loadIdx * As_x_loadSize + Ridx;
+                    int Asidy = As_loadIdy * As_y_loadSize + Ridy;
                     int Aidx = bAidx + Ridx;
                     int Aidy = bAidy + Ridy;
                     if(Aidx >= M1 || Aidy >= N)
-                        reinterpret_cast<float4*>(loadA[j][Ridy])[Ridx / 4] = {0.0f, 0.0f, 0.0f, 0.0f};
+                        reinterpret_cast<float4*>(As[Asidy])[Asidx / 4] = {0.0f, 0.0f, 0.0f, 0.0f};
                     else
-                        reinterpret_cast<float4*>(loadA[j][Ridy])[Ridx / 4] = 
+                        reinterpret_cast<float4*>(As[Asidy])[Asidx / 4] = 
                         reinterpret_cast<const float4*>(A)[(Aidy * M1 + Aidx) / 4];
                 }
         }
         for(int j = 0; j < y_tileLoadPasses; ++j)
         {
             int bBidx = blockIdx.x * x_blockSize + Bs_loadIdx * Bs_x_loadSize;
-            int bBidy = (i + 1) * tileSize + j * y_blockSize + Bs_loadIdy * Bs_y_loadSize;
+            int bBidy = i * tileSize + j * y_blockSize + Bs_loadIdy * Bs_y_loadSize;
             for(int Ridy = 0; Ridy < Bs_y_loadSize; ++Ridy)
                 for(int Ridx = 0; Ridx < Bs_x_loadSize; Ridx += 4)
                 {
+                    int Bsidx = Bs_loadIdx * Bs_x_loadSize + Ridx;
+                    int Bsidy = j * y_blockSize + Bs_loadIdy * Bs_y_loadSize + Ridy;
                     int Bidx = bBidx + Ridx;
                     int Bidy = bBidy + Ridy;
                     if(Bidx >= M2 || Bidy >= M1)
-                        reinterpret_cast<float4*>(loadB[j][Ridy])[Ridx / 4] = {0.0f, 0.0f, 0.0f, 0.0f};
+                        reinterpret_cast<float4*>(Bs[Bsidy])[Bsidx / 4] = {0.0f, 0.0f, 0.0f, 0.0f};
                     else
-                        reinterpret_cast<float4*>(loadB[j][Ridy])[Ridx / 4] = 
+                        reinterpret_cast<float4*>(Bs[Bsidy])[Bsidx / 4] = 
                         reinterpret_cast<const float4*>(B)[(Bidy * M2 + Bidx) / 4];
                 }
         }
-
+        __syncthreads();
         for(int j = 0; j < tileSize; ++j)
         {
             for(int Ridy = 0; Ridy < y_computeSize; ++Ridy)
@@ -160,41 +122,6 @@ __global__ void matrixProduct(const float *A,const float *B,float *C,int tileNum
                 }
         }
         __syncthreads();
-
-        for(int j = 0; j < x_tileLoadPasses; ++j)
-        {
-            for(int Ridy = 0; Ridy < As_y_loadSize; ++Ridy)
-                for(int Ridx = 0; Ridx < As_x_loadSize; Ridx += 4)
-                {
-                    int Asidx = j * x_blockSize + As_loadIdx * As_x_loadSize + Ridx;
-                    int Asidy = As_loadIdy * As_y_loadSize + Ridy;
-                    reinterpret_cast<float4*>(As[Asidy])[Asidx / 4] = 
-                    reinterpret_cast<const float4*>(loadA[j][Ridy])[Ridx / 4];
-                }
-        }
-        for(int j = 0; j < y_tileLoadPasses; ++j)
-        {
-            for(int Ridy = 0; Ridy < Bs_y_loadSize; ++Ridy)
-                for(int Ridx = 0; Ridx < Bs_x_loadSize; Ridx += 4)
-                {
-                    int Bsidx = Bs_loadIdx * Bs_x_loadSize + Ridx;
-                    int Bsidy = j * y_blockSize + Bs_loadIdy * Bs_y_loadSize + Ridy;
-                    reinterpret_cast<float4*>(Bs[Bsidy])[Bsidx / 4] = 
-                    reinterpret_cast<const float4*>(loadB[j][Ridy])[Ridx / 4];
-                }
-        }
-        __syncthreads();
-    }
-
-    for(int j = 0; j < tileSize; ++j)
-    {
-        for(int Ridy = 0; Ridy < y_computeSize; ++Ridy)
-            for(int Ridx = 0; Ridx < x_computeSize; ++Ridx)
-            {
-                int Asidy = computeIdy * y_computeSize + Ridy;
-                int Bsidx = computeIdx * x_computeSize + Ridx;
-                sum[Ridy][Ridx] += As[Asidy][j] * Bs[j][Bsidx];
-            }
     }
 
     for(int Ridy = 0; Ridy < y_computeSize; ++Ridy)
@@ -247,12 +174,14 @@ int main()
     int threadsPerBlock = threadNum;
     dim3 blockPerGird((M2 + x_blockSize - 1) / x_blockSize, (N + y_blockSize - 1) / y_blockSize);
     int tileNum = (M1 + tileSize - 1) / tileSize;
+    int x_tileLoadPasses = std::max(1, y_blockSize / x_blockSize);
+    int y_tileLoadPasses = std::max(1, x_blockSize / y_blockSize);
 
     for(int i = 0; i < warmupNum; ++i)
     {
         CHECK_CUDA(cudaMemcpy(d_C, h_C, size3, cudaMemcpyHostToDevice));
 
-        matrixProduct<<<blockPerGird,threadsPerBlock>>>(d_A, d_B, d_C, tileNum);
+        matrixProduct<<<blockPerGird,threadsPerBlock>>>(d_A, d_B, d_C, tileNum, x_tileLoadPasses, y_tileLoadPasses);
 
         CHECK_CUDA(cudaGetLastError());
         CHECK_CUDA(cudaDeviceSynchronize());
@@ -270,7 +199,7 @@ int main()
 
         CHECK_CUDA(cudaEventRecord(start));
 
-        matrixProduct<<<blockPerGird,threadsPerBlock>>>(d_A, d_B, d_C, tileNum);
+        matrixProduct<<<blockPerGird,threadsPerBlock>>>(d_A, d_B, d_C, tileNum, x_tileLoadPasses, y_tileLoadPasses);
         
         CHECK_CUDA(cudaGetLastError());
 

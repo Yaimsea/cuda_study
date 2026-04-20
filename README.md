@@ -42,7 +42,7 @@ ncu --version
 
 ## 矩阵乘法
 
-当前 [matrix_product.cu](/home/ngsxz/cuda_study/matrix_product.cu) 实现的是朴素版本矩阵乘法。
+当前 `matrix_product.cu` 实现的是朴素版本矩阵乘法。
 
 矩阵尺寸：
 
@@ -784,12 +784,12 @@ Lock target: 2850 MHz
 
 ### 手写 kernel 在正式档位下的新结果
 
-在把 `shared memory` 的标量搬运逐步改成 `float4` 向量化访存之后，当前主线已经不再是之前那版 `33 ms` 级别的 tuned kernel 了。
+在把 `shared memory` 的标量搬运逐步改成 `float4` 向量化访存之后，主线实现先从之前 `33 ms` 级别的版本推进到了 `21 ms` 档。
 
-这一轮最关键的变化主要有两点：
+这一阶段最关键的变化主要有两点：
 
 - `A` 和 `B` 都改成了 `float4` 的 global load + shared store
-- 当前最强配置不再是“每线程 `1 x 8` 计算”，而是：
+- `matrix_product.cu` 的主线配置第一次稳定收敛到：
 
 ```text
 x_blockSize = 32
@@ -801,7 +801,7 @@ Bs_x_loadSize = 4, Bs_y_loadSize = 4
 x_computeSize = 2, y_computeSize = 8
 ```
 
-在这一组参数下，当前主线版本 `matrix_product.cu` 已经能够稳定跑进 `21 ms` 左右。例如：
+在这一组参数下，`matrix_product.cu` 已经能够稳定跑进 `21 ms` 左右。例如：
 
 ```text
 Median kernel time: 21.0433 ms
@@ -817,62 +817,84 @@ The kernel time for these tests:
 21.4057 ms
 ```
 
-在此基础上，我又把不再需要的通用路径继续剥离，收敛成了当前的 `matrix_product_tuned.cu`。也就是说，现在项目里的文件分工更接近：
+在此基础上，我继续把不再需要的通用路径往下剥，并在这条 `float4` 主线上加入了寄存器预取 / software pipelining 风格的双缓冲。也就是说，当前 `matrix_product_tuned.cu` 的提速来源，不只是“参数更激进”，更关键的是：
 
-- `matrix_product.cu`：当前 `float4` 主线版本
-- `matrix_product_tuned.cu`：在这条主线上继续做参数专用化和路径剥离之后的 tuned 版本
+- 当前 tile 在 shared memory 中计算时，会先把下一 tile 预取到寄存器 `loadA/loadB`
+- 当前 tile 算完之后，再把寄存器里的下一 tile 写回 shared memory
+- 因此虽然它还不是 `cp.async` 式的真正异步拷贝，但已经是一种有效的 software-pipelined double buffering
 
-这版 tuned 结果进一步进入了 `20 ms` 档，但从多轮独立测试来看，最保守也最可信的代表值更接近：
+在这一版 tuned kernel 里，更强的参数组合已经变成：
 
 ```text
-Median kernel time ≈ 20.6 ms
+x_blockSize = 64
+y_blockSize = 64
+tileSize = 64
+threadNum = 128
+As_x_loadSize = 4, As_y_loadSize = 8
+Bs_x_loadSize = 4, Bs_y_loadSize = 8
+x_computeSize = 4, y_computeSize = 8
+As_padding = 0
+Bs_padding = 0
 ```
 
-代表性结果如下：
+在这一组参数下，当前 tuned 版 `matrix_product_tuned.cu` 的代表性结果如下：
 
 ```text
-Median kernel time: 20.1543 ms
+Median kernel time: 17.8538 ms
 The kernel time for these tests:
-20.0679 ms
-20.0701 ms
-20.1174 ms
-20.1277 ms
-20.1543 ms
-20.3902 ms
-20.5478 ms
-20.5554 ms
-20.5724 ms
+17.6632 ms
+17.6763 ms
+17.7208 ms
+17.7743 ms
+17.8538 ms
+17.9485 ms
+17.9973 ms
+18.0250 ms
+18.1913 ms
 ```
 
 ```text
-Median kernel time: 20.5583 ms
+Median kernel time: 17.7453 ms
 The kernel time for these tests:
-20.0764 ms
-20.2141 ms
-20.2283 ms
-20.4803 ms
-20.5583 ms
-20.5926 ms
-20.695 ms
-20.8499 ms
-20.8735 ms
+17.5930 ms
+17.6521 ms
+17.6651 ms
+17.6818 ms
+17.7453 ms
+17.9719 ms
+18.0055 ms
+18.3306 ms
+18.3523 ms
 ```
 
 ```text
-Median kernel time: 20.6282 ms
+Median kernel time: 17.7168 ms
 The kernel time for these tests:
-20.1436 ms
-20.2153 ms
-20.6139 ms
-20.6218 ms
-20.6282 ms
-20.647 ms
-20.6687 ms
-20.786 ms
-21.1951 ms
+17.6624 ms
+17.6818 ms
+17.6860 ms
+17.6866 ms
+17.7168 ms
+17.7266 ms
+17.8820 ms
+17.9896 ms
+18.2984 ms
 ```
 
-也就是说，这版 tuned kernel 在当前正式规程下已经基本稳定在 `20.5 ~ 20.6 ms` 这一带。第一轮虽然偶尔能跑到 `20.15 ms`，但从后续重测来看，把 `20.6 ms` 视为当前更稳妥的正式成绩会更合适。
+因此，这一轮更保守也更可信的正式成绩可以记成：
+
+```text
+Median kernel time ≈ 17.77 ms
+```
+
+也就是说，这里从 `21 ms` 档进一步推进到 `17 ms` 档，主因不是某个“玄学参数”，而是：
+
+- `float4` 向量化访存
+- 更大的 `64x64 tile`
+- 更高的每线程计算量
+- 寄存器预取 / software pipelining 风格的双缓冲
+
+当前 `matrix_product_tuned.cu` 的 `17 ms` 档成绩，本质上就是在这几条因素共同作用下兑现出来的。
 
 ### wavefront 与 bank conflict 的新理解
 
@@ -893,7 +915,7 @@ The kernel time for these tests:
 把之前那种明显的、结构性的 shared-store bank conflict 打散了。
 ```
 
-更具体地说，旧版标量 store 的 `Bs` 装载路径会形成非常重的结构性冲突；而当前 `float4` 版本虽然不敢轻易说“所有机器级 conflict 都绝对消失了”，但至少已经避开了之前那种一眼就能看出来的大冲突。这也是它能够一下子从 `33 ms` 档推进到 `20 ms` 档的重要原因之一。
+更具体地说，旧版标量 store 的 `Bs` 装载路径会形成非常重的结构性冲突；而当前 `float4` 版本虽然不敢轻易说“所有机器级 conflict 都绝对消失了”，但至少已经避开了之前那种一眼就能看出来的大冲突。这也是它能够一下子从 `33 ms` 档推进到 `20 ms` 以内，并进一步压到 `17 ms` 档的重要原因之一。
 
 ### cuBLAS 对照结果
 
@@ -923,20 +945,20 @@ Median kernel time ≈ 13.46 ms
 在统一锁频目标和统一 benchmark 规程下，目前更合理的正式对比应写成：
 
 ```text
-Handwritten kernel (tuned): ≈ 20.6 ms
+Handwritten kernel (tuned): ≈ 17.77 ms
 cuBLAS SGEMM:               ≈ 13.46 ms
 ```
 
 因此，当前手写版本相对 `cuBLAS` 的性能比例大约为：
 
 ```text
-13.4553 / 20.6 ≈ 65%
+13.4553 / 17.77 ≈ 76%
 ```
 
 也就是说，在目前这版实现、这套测试数据以及这套正式规程下，我的手写矩阵乘法已经达到了同卡 `cuBLAS` 的大约：
 
 ```text
-65%
+76%
 ```
 
 到目前为止，这一阶段最重要的收获主要有下面几点：
@@ -945,5 +967,5 @@ cuBLAS SGEMM:               ≈ 13.46 ms
 - 锁频时应该关心“哪一个目标档位能带来最稳定的整体运行状态”，而不是只看名义频率
 - `2850 MHz` 这个目标锁频值虽然实际跑不到 `2850`，但它对应的实验结果最稳定，因此适合作为正式对照实验档位
 - 旧版的主要瓶颈确实和 `shared store bank conflict / excessive wavefront` 强相关，而 `float4` 的引入显著改善了这条路径
-- 用通用框架验证方向仍然有价值，但真正的成绩兑现还是更依赖后面的专门 tuned 实现
-- 在统一实验条件下，当前手写 kernel 已经能够稳定达到 `cuBLAS` 的约 `65%`
+- 用通用框架验证方向仍然有价值，但真正把成绩从 `21 ms` 档推进到 `17 ms` 档的关键，还是 tuned 版里那套寄存器预取 / software pipelining 风格的双缓冲实现
+- 在统一实验条件下，当前手写 kernel 已经能够稳定达到 `cuBLAS` 的约 `76%`
