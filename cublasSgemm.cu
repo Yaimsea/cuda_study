@@ -88,6 +88,7 @@ int main()
 
     cublasHandle_t handle;
     CHECK_CUBLAS(cublasCreate(&handle));
+    CHECK_CUBLAS(cublasSetMathMode(handle, CUBLAS_PEDANTIC_MATH));
 
     for(int i = 0; i < warmupNum; ++i)
     {

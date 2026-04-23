@@ -969,3 +969,124 @@ cuBLAS SGEMM:               ≈ 13.46 ms
 - 旧版的主要瓶颈确实和 `shared store bank conflict / excessive wavefront` 强相关，而 `float4` 的引入显著改善了这条路径
 - 用通用框架验证方向仍然有价值，但真正把成绩从 `21 ms` 档推进到 `17 ms` 档的关键，还是 tuned 版里那套寄存器预取 / software pipelining 风格的双缓冲实现
 - 在统一实验条件下，当前手写 kernel 已经能够稳定达到 `cuBLAS` 的约 `76%`
+
+### 通用 SGEMM demo
+
+在完成固定尺寸 `4096 x 4096 x 4096` 的手写矩阵乘法优化之后，我开始把实现从单一实验 kernel 整理成一个更接近库函数形式的 `SGEMM` demo。
+
+这一版的目标不再只是“跑通一个固定尺寸”，而是提供一个基础的：
+
+```text
+C = A * B
+A: M x K
+B: K x N
+C: M x N
+```
+
+当前 `SGEMM.cu` 中的接口已经具备下面几个分支：
+
+- 大尺寸矩阵优先走 `float4` fast path
+- 当大尺寸矩阵的 `K` 或 `N` 不是 `4` 的倍数时，在接口内部创建 padded buffer，保证 `float4` 访问满足 16B 对齐要求
+- 中小尺寸矩阵走标量 tiled fallback
+- 极小尺寸矩阵走更保守的 `1x1` fallback
+- 非法尺寸直接返回错误提示
+
+这里需要明确区分两个测试口径：
+
+```text
+kernel profiling:
+  使用 Nsight Compute 单独分析某个 kernel 的 duration、throughput、occupancy、bank conflict 等。
+
+SGEMM demo benchmark:
+  使用 cudaEvent 围绕 SGEMM() 接口计时。
+  如果接口内部发生 padding、cudaMemcpy2D、cudaMemset、临时显存申请/释放，这些都会计入接口时间。
+```
+
+也就是说，这一节里的时间不再单纯表示某一个 `matrixProduct` kernel 的裸执行时间，而是当前 `SGEMM()` demo 的接口级 GPU 时间。程序输出里仍然沿用 `Median kernel time` 字样，但在这一版 demo 里，它更准确地说是 `SGEMM()` 调用的 median time。
+
+当前测试结果如下：
+
+```text
+Test #1: M=4096, N=4096, K=4096
+Median time: 17.7327 ms
+Max relative error: 5.60922e-05
+
+Test #2: M=4096, N=2048, K=4096
+Median time: 8.02874 ms
+Max relative error: 5.60922e-05
+
+Test #3: M=4095, N=2047, K=1025
+Median time: 4.14634 ms
+Max relative error: 1.3491e-05
+
+Test #4: M=256, N=256, K=256
+Median time: 0.067008 ms
+Max relative error: 3.34147e-06
+
+Test #5: M=255, N=127, K=256
+Median time: 0.044384 ms
+Max relative error: 3.34147e-06
+
+Test #6: M=511, N=255, K=129
+Median time: 0.053408 ms
+Max relative error: 1.7602e-06
+
+Test #7: M=8, N=8, K=8
+Median time: 0.008192 ms
+Max relative error: 1.06437e-07
+
+Test #8: M=8, N=7, K=9
+Median time: 0.008192 ms
+Max relative error: 1.08126e-07
+
+Test #9: M=1, N=1, K=1
+Median time: 0.01024 ms
+Max relative error: 0
+
+Test #10: M=0, N=100, K=200
+The matrix size is invalid.
+```
+
+从这些结果可以看到，当前实现已经不再只是固定尺寸 kernel，而是具备了 SGEMM demo 的基本形态：
+
+- 对主流大矩阵尺寸，仍然能够复用之前 `64x64x64 + float4 + software pipelining` 的高性能路径
+- 对非 `float4` 对齐的大矩阵，接口内部会通过 padding 解决对齐问题
+- 对中小矩阵和极小矩阵，至少有正确的 fallback 路径
+- 当前 demo 已经能够覆盖多组非整齐尺寸并通过正确性检查
+
+这一版还不是工业级 SGEMM 库。后续如果继续完善，可以重点考虑：
+
+- 加入 `alpha` / `beta`
+- 支持 `lda` / `ldb` / `ldc`
+- 支持 transpose 形式
+- 复用 workspace，避免每次 padding 都重新 `cudaMalloc` / `cudaFree`
+- 针对不同尺寸区间继续调参
+- 用 Nsight Compute 单独分析各个 kernel 分支
+
+但作为当前阶段的学习项目，这一版已经可以被视为一个合格的 `SGEMM` demo：它既保留了前面优化出来的高性能大矩阵路径，也开始具备通用接口、尺寸分派、padding 对齐和 fallback 的基本结构。
+
+### cuBLAS Tensor Core 对照
+
+为了让手写 FP32 kernel 与 `cuBLAS` 的对比更公平，我在 `cublasSgemm.cu` 中显式设置：
+
+```cpp
+cublasSetMathMode(handle, CUBLAS_PEDANTIC_MATH);
+```
+
+在这个模式下，`cuBLAS` 不再使用 TF32 Tensor Core 路径。对应的代表性结果仍然约为：
+
+```text
+cuBLAS SGEMM, Tensor Core disabled:
+Median time ≈ 13.47 ms
+Max relative error ≈ 5.60922e-05
+```
+
+作为对照，如果显式允许 TF32 Tensor Core，`cuBLAS` 会明显更快，但误差也会增大：
+
+```text
+cuBLAS SGEMM, TF32 Tensor Core enabled:
+Median time: 8.67574 ms
+Max relative error: 5.2955e-04
+```
+
+这说明之前 `13 ms` 档的 `cuBLAS` 对照基本可以视为 FP32 CUDA core 路径，而不是 Tensor Core 路径。因此，当前手写 FP32 SGEMM 更合理的对照对象仍然是禁用 Tensor Core 后的 `cuBLAS SGEMM`。
